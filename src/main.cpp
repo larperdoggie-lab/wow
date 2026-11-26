@@ -1,8 +1,8 @@
-// Predictive Input - draft Geode mod (UNTESTED, not compiled).
-// Target: Geode v6 branch / GD 2.2091.
+// Predictive Input - draft Geode mod (untested in-game).
+// Target: Geode v6.0.0 / GD 2.2091.
 //
-// Lines tagged "ENGINE:" touch game internals whose names or semantics may
-// differ on the v6 bindings. Everything else is plain logic.
+// Lines tagged "ENGINE:" touch game internals that may behave differently
+// than assumed; they are the first place to look if predictions are off.
 
 #include <Geode/Geode.hpp>
 #include <Geode/modify/GJBaseGameLayer.hpp>
@@ -24,23 +24,16 @@ namespace {
 	constexpr int kJump = 1;
 
 	int g_modeIdx = 0;
-	int g_tick = 0;  // counts real physics ticks (see processQueuedButtons hook)
+	int g_tick = 0;  // counts real physics ticks (see processCommands hook)
 
 	// Inputs we are holding back, plus the delay currently applied per player
 	struct Pending { bool down; bool p1; int due; };
 	std::deque<Pending> g_pending;
 	int g_delay[2] = {0, 0};
 
-	// Scripted input used while simulating ahead
-	struct Script {
-		bool active = false;
-		int step = 0;
-		int eventStep = 0;
-		bool down = true;
-		bool p1 = true;
-	} g_sim;
+	bool g_simActive = false;   // true while playing out a lookahead
 	bool g_simDied = false;
-	bool g_passThrough = false;
+	bool g_passThrough = false; // true while we re-inject an input ourselves
 
 	// X positions of gamemode / speed / mirror / teleport portals
 	std::vector<float> g_portalX;
@@ -48,10 +41,10 @@ namespace {
 	bool isSpecialPortal(int id) {
 		switch (id) {
 			case 12: case 13: case 47: case 111: case 660:
-			case 745: case 1331: case 1933:          // gamemode
+			case 745: case 1331: case 1933:                     // gamemode
 			case 200: case 201: case 202: case 203: case 1334:  // speed
-			case 45: case 46:                        // mirror
-			case 747:                                // teleport
+			case 45: case 46:                                   // mirror
+			case 747:                                           // teleport
 				return true;
 			default:
 				return false;
@@ -70,18 +63,40 @@ namespace {
 			[&](Pending const& p) { return p.p1 == p1; });
 	}
 
+	// Release every held-back input whose time has come
+	void flushPending(GJBaseGameLayer* gl) {
+		for (auto it = g_pending.begin(); it != g_pending.end();) {
+			if (it->due <= g_tick) {
+				g_passThrough = true;
+				gl->handleButton(it->down, kJump, it->p1);
+				g_passThrough = false;
+				it = g_pending.erase(it);
+			} else {
+				++it;
+			}
+		}
+	}
+
 	// Play the input out `delay` ticks from now and report whether we survive
 	// for `horizon` ticks afterwards (input state is held as-is).
 	bool survives(PlayLayer* pl, CheckpointObject* base, bool down, bool p1, int delay, int horizon) {
 		pl->loadFromCheckpoint(base);  // ENGINE: restores player + effect state
-		g_sim = Script{true, 0, delay, down, p1};
+		g_simActive = true;
 		g_simDied = false;
 
 		const int total = delay + horizon;
-		for (int guard = 0; g_sim.step < total && !g_simDied && guard < total * 4; ++guard) {
-			pl->processCommands(kTickDt);  // ENGINE: must advance exactly one tick
+		for (int step = 0; step < total && !g_simDied; ++step) {
+			if (step == delay) {
+				g_passThrough = true;
+				pl->handleButton(down, kJump, p1);
+				g_passThrough = false;
+			}
+			// ENGINE: one full tick. If sounds double up while predicting,
+			// try changing the last argument to false.
+			pl->processCommands(kTickDt, false, true);
 		}
-		g_sim.active = false;
+
+		g_simActive = false;
 		return !g_simDied;
 	}
 
@@ -89,7 +104,7 @@ namespace {
 	int pickDelay(PlayLayer* pl, bool down, bool p1, int maxDelay, int horizon) {
 		CheckpointObject* base = pl->createCheckpoint();  // ENGINE
 		base->retain();
-		auto savedQueue = pl->m_queuedButtons;            // ENGINE
+		auto savedQueue = pl->m_queuedButtons;
 
 		int result = 0;
 		if (!survives(pl, base, down, p1, 0, horizon)) {
@@ -111,7 +126,7 @@ namespace {
 class $modify(PredGameLayer, GJBaseGameLayer) {
 	void handleButton(bool down, int button, bool p1) {
 		auto pl = PlayLayer::get();
-		if (g_sim.active || g_passThrough || button != kJump || !pl ||
+		if (g_simActive || g_passThrough || button != kJump || !pl ||
 			static_cast<GJBaseGameLayer*>(pl) != this) {
 			return GJBaseGameLayer::handleButton(down, button, p1);
 		}
@@ -159,28 +174,20 @@ class $modify(PredGameLayer, GJBaseGameLayer) {
 		g_pending.push_back({down, p1, g_tick + d});
 	}
 
-	// ENGINE: assumed to run once per physics tick, before inputs are applied
-	void processQueuedButtons(float dt, bool clearInputQueue) {
-		if (g_sim.active) {
-			if (g_sim.step == g_sim.eventStep) {
-				g_passThrough = true;
-				GJBaseGameLayer::handleButton(g_sim.down, kJump, g_sim.p1);
-				g_passThrough = false;
-			}
-			++g_sim.step;
-			return;  // lookahead never touches the real input queue
+	// ENGINE: assumed to run once per full physics tick (not for half ticks)
+	void processCommands(float dt, bool isHalfTick, bool isLastTick) {
+		if (!g_simActive && !isHalfTick) {
+			++g_tick;
+			flushPending(this);
 		}
+		GJBaseGameLayer::processCommands(dt, isHalfTick, isLastTick);
+	}
 
-		++g_tick;
-		for (auto it = g_pending.begin(); it != g_pending.end();) {
-			if (it->due <= g_tick) {
-				g_passThrough = true;
-				GJBaseGameLayer::handleButton(it->down, kJump, it->p1);
-				g_passThrough = false;
-				it = g_pending.erase(it);
-			} else {
-				++it;
-			}
+	// While simulating, ignore the real input queue (the lookahead uses its
+	// own scripted input instead).
+	void processQueuedButtons(float dt, bool clearInputQueue) {
+		if (g_simActive) {
+			return;
 		}
 		GJBaseGameLayer::processQueuedButtons(dt, clearInputQueue);
 	}
@@ -205,7 +212,7 @@ class $modify(PredPlayLayer, PlayLayer) {
 	}
 
 	void destroyPlayer(PlayerObject* player, GameObject* obj) {
-		if (g_sim.active) {  // a simulated death: record it, no effects
+		if (g_simActive) {  // a simulated death: record it, no effects
 			g_simDied = true;
 			return;
 		}
@@ -213,10 +220,9 @@ class $modify(PredPlayLayer, PlayLayer) {
 	}
 };
 
-// F6 cycles modes. ENGINE: the dispatcher signature may carry an extra
-// timestamp parameter on newer SDKs.
+// F6 cycles modes
 class $modify(PredKeys, CCKeyboardDispatcher) {
-	bool dispatchKeyboardMSG(enumKeyCodes key, bool down, bool repeat) {
+	bool dispatchKeyboardMSG(enumKeyCodes key, bool down, bool repeat, double timestamp) {
 		if (down && !repeat && key == KEY_F6 && PlayLayer::get()) {
 			g_modeIdx = (g_modeIdx + 1) % kModeCount;
 			auto text = g_modeIdx == 0
@@ -224,6 +230,6 @@ class $modify(PredKeys, CCKeyboardDispatcher) {
 				: fmt::format("Predictive input: {} ticks", kModes[g_modeIdx]);
 			Notification::create(text, NotificationIcon::None, 0.8f)->show();
 		}
-		return CCKeyboardDispatcher::dispatchKeyboardMSG(key, down, repeat);
+		return CCKeyboardDispatcher::dispatchKeyboardMSG(key, down, repeat, timestamp);
 	}
 };
