@@ -1,0 +1,28 @@
+{
+	"geode": "6.0.0",
+	"gd": {
+		"win": "2.2091"
+	},
+	"id": "yourname.predictiveinput",
+	"name": "Predictive Input",
+	"version": "v1.0.0",
+	"developer": "yourname",
+	"description": "Holds a click back a few ticks when clicking right now would kill you.",
+	"settings": {
+		"lookahead": {
+			"type": "int",
+			"name": "Lookahead (ticks)",
+			"description": "How many ticks past the click to simulate when checking for a crash. Higher is safer but heavier.",
+			"default": 24,
+			"min": 8,
+			"max": 96,
+			"control": { "slider": true }
+		},
+		"wave-release": {
+			"type": "bool",
+			"name": "Check wave releases",
+			"description": "Also hold back wave releases that would clip a hazard.",
+			"default": true
+		}
+	}
+}
